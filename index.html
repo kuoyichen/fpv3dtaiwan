@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>3D 無人機 FPV 飛行模擬器</title>
+    
+    <!-- 1. 基礎設定與環境攔截 (Hack) -->
+    <script>
+        // A. 攔截 getContext 強制忽略效能警告 (避免沙盒環境 WebGL 報錯)
+        const originalGetContext = HTMLCanvasElement.prototype.getContext;
+        HTMLCanvasElement.prototype.getContext = function(type, options) {
+            if (options && options.failIfMajorPerformanceCaveat !== undefined) {
+                options.failIfMajorPerformanceCaveat = false;
+            }
+            return originalGetContext.call(this, type, options);
+        };
+
+        // B. 超級攔截器：過濾 ArcGIS Web Worker 拋出的雜訊
+        const filterKeywords = [
+            'stream-data-loader', 'request:server', 'I3SOnDemandController', 
+            'textures', '1_jpg', 'Failed to request resource', 'AbortError'
+        ];
+        
+        ['log', 'warn', 'error'].forEach(method => {
+            const original = console[method];
+            console[method] = function(...args) {
+                let shouldBlock = false;
+                try {
+                    const strArgs = args.map(a => String(a)).join(' ');
+                    if (filterKeywords.some(kw => strArgs.includes(kw))) {
+                        shouldBlock = true;
+                    }
+                } catch (e) {}
+                if (!shouldBlock) original.apply(console, args);
+            };
+        });
+
+        // C. 攔截 Unhandled Rejection，確保畫面乾淨
+        window.addEventListener('unhandledrejection', function(event) {
+            let shouldBlock = false;
+            try {
+                const reason = event.reason;
+                if (reason) {
+                    const name = reason.name || '';
+                    const msg = reason.message || '';
+                    const details = (reason.details && reason.details.error) ? reason.details.error : '';
+                    const combined = `${name} ${msg} ${details}`;
+                    
+                    if (filterKeywords.some(kw => combined.includes(kw))) {
+                        shouldBlock = true;
+                    }
+                }
+            } catch (e) {}
+
+            if (shouldBlock) {
+                event.preventDefault();
+                event.stopImmediatePropagation();
+            }
+        }, true);
+    </script>
+
+    <!-- 載入 Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            overflow: hidden; background-color: #000;
+            font-family: 'Inter', sans-serif;
+        }
+
+        #viewDiv {
+            position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+        }
+
+        /* 隱藏 ArcGIS 預設底部版權資訊，保持畫面乾淨 */
+        .esri-view-surface:focus::after { outline: none !important; }
+        .esri-attribution { display: none !important; }
+
+        /* HUD 與 UI 面板 */
+        .glass-panel {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(8px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: #10b981; /* Tailwind emerald-500 */
+            text-shadow: 0 0 5px rgba(16, 185, 129, 0.5);
+        }
+
+        /* 虛擬搖桿 */
+        .joystick-zone {
+            position: absolute; bottom: 20px; width: 120px; height: 120px;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid rgba(16, 185, 129, 0.3);
+            border-radius: 50%;
+            touch-action: none;
+            display: flex; justify-content: center; align-items: center;
+            pointer-events: auto;
+        }
+        .joystick-knob {
+            width: 50px; height: 50px;
+            background: rgba(16, 185, 129, 0.8);
+            border-radius: 50%;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.5);
+            position: absolute;
+            transition: transform 0.05s ease-out;
+        }
+
+        #joystick-left { left: 30px; }
+        #joystick-right { right: 30px; }
+
+        /* 中央準星 */
+        .crosshair {
+            position: absolute; top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            pointer-events: none;
+        }
+        .crosshair::before, .crosshair::after {
+            content: ''; position: absolute; background: rgba(16, 185, 129, 0.6);
+        }
+        .crosshair::before { width: 20px; height: 2px; top: -1px; left: -10px; }
+        .crosshair::after { width: 2px; height: 20px; left: -1px; top: -10px; }
+
+        /* Loading Spinner */
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .spinner {
+            border: 4px solid rgba(255, 255, 255, 0.1);
+            border-top: 4px solid #10b981;
+            border-radius: 50%; width: 40px; height: 40px;
+            animation: spin 1s linear infinite;
+        }
+
+        /* Toast 訊息 */
+        #toast {
+            transition: opacity 0.3s ease-in-out, transform 0.3s ease-in-out;
+            opacity: 0; transform: translateY(-20px) translateX(-50%);
+            pointer-events: none;
+        }
+        #toast.show { opacity: 1; transform: translateY(0) translateX(-50%); }
+
+        @media (min-width: 768px) {
+            .mobile-only { display: none !important; }
+        }
+    </style>
+</head>
+<body>
+    <!-- 地圖容器 -->
+    <div id="viewDiv"></div>
+
+    <!-- 左上角 HUD 與 控制面板 -->
+    <div class="absolute top-4 left-4 p-2 rounded-lg glass-panel flex flex-col gap-1 z-10 pointer-events-auto">
+        <div class="text-[6px] font-bold tracking-widest text-emerald-300 pointer-events-none mb-1">FPV FLIGHT DATA</div>
+        <div class="text-xs font-mono pointer-events-none">ALT: <span id="hud-alt">200</span> M</div>
+        <div class="text-xs font-mono pointer-events-none mb-2">SPD: <span id="hud-spd">0</span> KM/H</div>
+        
+        <!-- 速度選擇器 -->
+        <label class="block text-[6px] font-bold text-emerald-300 mb-0.5">飛行速度</label>
+        <select id="speed-select" class="w-full bg-slate-800 text-emerald-400 border border-emerald-500/30 rounded p-0.5 text-[8px] outline-none focus:border-emerald-500">
+            <option value="low" selected>低速 (預設)</option>
+            <option value="medium">中速</option>
+            <option value="high">高速</option>
+        </select>
+    </div>
+
+    <!-- 中央準星 -->
+    <div class="crosshair"></div>
+
+    <!-- 右上角選單與搜尋 -->
+    <div class="absolute top-4 right-4 rounded-lg glass-panel p-2 z-10 w-40 shadow-lg pointer-events-auto">
+        <label class="block text-[6px] font-bold text-emerald-300 mb-0.5">快速跳轉景點</label>
+        <select id="location-select" class="w-full bg-slate-800 text-emerald-400 border border-emerald-500/30 rounded p-0.5 mb-1.5 text-[8px] outline-none focus:border-emerald-500">
+            <option value="120.6853,24.1370,200">臺中火車站</option>
+            <option value="121.5644,25.0339,600">台北 101</option>
+            <option value="121.7395,25.1322,300">基隆港</option>
+            <option value="121.5458,25.1620,1000">陽明山</option>
+            <option value="121.2320,25.0797,300">桃園機場</option>
+            <option value="120.9122,23.8523,1000">日月潭</option>
+            <option value="120.8041,23.5085,2500">阿里山</option>
+            <option value="121.6224,24.1648,800">太魯閣</option>
+            <option value="120.7963,21.9463,200">墾丁</option>
+            <option value="121.6318,24.0256,150">七星潭</option>
+            <option value="120.9573,23.4700,4200">玉山主峰</option>
+            <option value="120.2965,22.6800,200">蓮池潭</option>
+        </select>
+
+        <label class="block text-[6px] font-bold text-emerald-300 mb-0.5">搜尋並飛往</label>
+        <div class="flex gap-1">
+            <input type="text" id="search-input" placeholder="例如: 高雄流行音樂中心" class="w-full bg-slate-800 text-emerald-400 border border-emerald-500/30 rounded p-0.5 text-[6px] outline-none focus:border-emerald-500">
+            <button id="search-btn" class="bg-emerald-600 hover:bg-emerald-500 text-white px-1.5 py-0.5 rounded text-[6px] transition-colors">Go</button>
+        </div>
+    </div>
+
+    <!-- 中央上方 地址顯示 HUD -->
+    <div id="address-hud" class="absolute top-4 left-1/2 -translate-x-1/2 glass-panel px-4 py-1.5 rounded-full font-bold text-emerald-300 text-[10px] tracking-wide shadow-xl z-20 hidden whitespace-nowrap">
+        定位中...
+    </div>
+
+    <!-- Toast 訊息框 (稍微下移避免與地址重疊) -->
+    <div id="toast" class="absolute top-14 left-1/2 glass-panel px-4 py-1.5 rounded-full font-bold text-emerald-400 text-[8px] shadow-xl z-50">
+        系統訊息
+    </div>
+
+    <!-- 虛擬搖桿 (僅在觸控/小螢幕時使用，但保留 DOM 以支援測試) -->
+    <div id="joystick-left" class="joystick-zone md:hidden">
+        <div class="absolute -top-4 text-[6px] text-emerald-400/70">轉向 / 前進</div>
+        <div id="knob-left" class="joystick-knob"></div>
+    </div>
+    <div id="joystick-right" class="joystick-zone md:hidden">
+        <div class="absolute -top-4 text-[6px] text-emerald-400/70">上升 / 下降</div>
+        <div id="knob-right" class="joystick-knob"></div>
+    </div>
+
+    <!-- Loading 遮罩 -->
+    <div id="loading" class="absolute inset-0 bg-slate-900/90 flex flex-col items-center justify-center z-40 transition-opacity duration-500">
+        <div class="spinner mb-2"></div>
+        <h2 class="text-emerald-400 font-mono text-[10px] tracking-wider animate-pulse">載入 3D 引擎與台灣圖層...</h2>
+    </div>
+
+    <script type="module">
+        import Map from "https://js.arcgis.com/4.29/@arcgis/core/Map.js";
+        import SceneView from "https://js.arcgis.com/4.29/@arcgis/core/views/SceneView.js";
+        import SceneLayer from "https://js.arcgis.com/4.29/@arcgis/core/layers/SceneLayer.js";
+
+        // --- UI 工具函式 ---
+        function showToast(message, duration = 3000) {
+            const toast = document.getElementById('toast');
+            toast.innerText = message;
+            toast.classList.add('show');
+            setTimeout(() => toast.classList.remove('show'), duration);
+        }
+
+        // --- ArcGIS 初始化 ---
+        const map = new Map({
+            basemap: "satellite",
+            ground: "world-elevation"
+        });
+
+        // 載入台灣 22 縣市 I3S 建物圖層
+        const layerIds = [0,11,1,12,2,13,3,14,4,15,5,16,6,17,7,18,8,19,9,20,10,21];
+        layerIds.forEach(id => {
+            const sceneLayer = new SceneLayer({
+                url: `https://i3s.nlsc.gov.tw/building/i3s/SceneServer/layers/${id}`,
+                title: `Taiwan_City_${id}`
+            });
+            map.add(sceneLayer);
+        });
+
+        const view = new SceneView({
+            container: "viewDiv",
+            map: map,
+            camera: {
+                position: { longitude: 120.6853, latitude: 24.1370, z: 200 }, // 初始：台中火車站
+                heading: 0,
+                tilt: 75
+            },
+            ui: { components: [] }, // 清除預設 UI (縮放按鈕等)
+            environment: {
+                lighting: { type: "sun", date: new Date("March 15, 2024 10:00:00 UTC"), directShadowsEnabled: true },
+                atmosphereEnabled: true
+            }
+        });
+
+        view.when(() => {
+            document.getElementById('loading').style.opacity = '0';
+            setTimeout(() => document.getElementById('loading').remove(), 500);
+            showToast("系統準備完畢，可以起飛！");
+
+            // 顯示地址並進行第一次定位
+            const addressHud = document.getElementById('address-hud');
+            addressHud.classList.remove('hidden');
+            updateAddress(view.camera.position.longitude, view.camera.position.latitude);
+        });
+
+        const addressHud = document.getElementById('address-hud');
+        let lastGeoLoc = { lon: 0, lat: 0 };
+        let isFetchingGeo = false;
+
+        async function updateAddress(lon, lat) {
+            if (isFetchingGeo) return;
+            isFetchingGeo = true;
+            lastGeoLoc = { lon, lat };
+            
+            try {
+                // 使用 Nominatim 進行反向地理編碼 (加入 Accept-Language 確保回傳中文)
+                const res = await fetch(`https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}&zoom=16&addressdetails=1&accept-language=zh-TW`);
+                const data = await res.json();
+                if (data && data.address) {
+                    const a = data.address;
+                    const city = a.city || a.county || '';
+                    const dist = a.town || a.district || a.suburb || '';
+                    const road = a.road || a.pedestrian || a.village || a.neighbourhood || '';
+                    const shortAddr = `${city}${dist}${road}` || '未知區域';
+                    addressHud.innerText = shortAddr;
+                } else {
+                    addressHud.innerText = "未知區域";
+                }
+            } catch (err) {
+                // 忽略錯誤避免影響效能
+            } finally {
+                // 限制 API 請求頻率 (Nominatim 規範要求，設為 2.5 秒)
+                setTimeout(() => { isFetchingGeo = false; }, 2500);
+            }
+        }
+
+        // --- STREAMING_CHUNK:Drone State and Game Loop ---
+        const droneState = {
+            forward: 0,  // 前進/後退: -1 ~ 1
+            turn: 0,     // 左轉/右轉: -1 ~ 1
+            vertical: 0, // 上升/下降: -1 ~ 1
+            maxSpeed: 0.00002, // 初始設為低速 (約 80-100 km/h)
+            maxAltitudeSpeed: 1 // 高度變化速度也相對調低，以配合低速
+        };
+
+        // 速度設定對應表 (經緯度單位的大約速度)
+        const speedSettings = {
+            low: { speed: 0.00002, altSpeed: 1 },    // 約 80-100 KM/H
+            medium: { speed: 0.0001, altSpeed: 3 },   // 約 500 KM/H
+            high: { speed: 0.0003, altSpeed: 5 }      // 原本的高速
+        };
+
+        // 監聽速度選擇器變更
+        document.getElementById('speed-select').addEventListener('change', (e) => {
+            const mode = e.target.value;
+            if (speedSettings[mode]) {
+                droneState.maxSpeed = speedSettings[mode].speed;
+                droneState.maxAltitudeSpeed = speedSettings[mode].altSpeed;
+                e.target.blur(); // 移除焦點避免按鍵衝突
+            }
+        });
+
+        const hudAlt = document.getElementById('hud-alt');
+        const hudSpd = document.getElementById('hud-spd');
+
+        function gameLoop() {
+            if (droneState.forward !== 0 || droneState.turn !== 0 || droneState.vertical !== 0) {
+                const camera = view.camera.clone();
+                
+                // 1. 轉向 (Yaw)
+                camera.heading += droneState.turn * 1.5;
+
+                // 2. 前進/後退 (Pitch 轉換為平面位移)
+                if (droneState.forward !== 0) {
+                    const rad = camera.heading * (Math.PI / 180);
+                    const speed = droneState.forward * droneState.maxSpeed;
+                    // ArcGIS 的經緯度簡單推算
+                    camera.position.longitude += Math.sin(rad) * speed;
+                    camera.position.latitude += Math.cos(rad) * speed;
+                }
+
+                // 3. 上升/下降 (Throttle)
+                camera.position.z += droneState.vertical * droneState.maxAltitudeSpeed;
+                if (camera.position.z < 5) camera.position.z = 5; // 防撞地表限制
+
+                // 4. 更新視角
+                view.camera = camera;
+
+                // 5. 更新 HUD
+                // 粗略將經緯度位移轉換為 km/h (1度約111km，每幀60fps計算)
+                const currentSpeedKmH = Math.abs(droneState.forward * droneState.maxSpeed * 111000 * 3.6 * 60);
+                hudSpd.innerText = Math.round(currentSpeedKmH);
+                hudAlt.innerText = Math.round(camera.position.z);
+
+                // 6. 檢查是否需要更新地址 (移動距離超過閾值，約 50 公尺)
+                const dx = camera.position.longitude - lastGeoLoc.lon;
+                const dy = camera.position.latitude - lastGeoLoc.lat;
+                if (dx * dx + dy * dy > 0.00000025) { 
+                    updateAddress(camera.position.longitude, camera.position.latitude);
+                }
+            } else {
+                hudSpd.innerText = "0";
+            }
+            requestAnimationFrame(gameLoop);
+        }
+        requestAnimationFrame(gameLoop);
+
+        // --- STREAMING_CHUNK:Keyboard Controls ---
+        window.addEventListener('keydown', (e) => {
+            switch(e.key.toLowerCase()) {
+                case 'w': droneState.forward = 1; break;
+                case 's': droneState.forward = -1; break;
+                case 'a': droneState.turn = -1; break;
+                case 'd': droneState.turn = 1; break;
+                case 'arrowup': droneState.vertical = 1; break;
+                case 'arrowdown': droneState.vertical = -1; break;
+            }
+        });
+
+        window.addEventListener('keyup', (e) => {
+            switch(e.key.toLowerCase()) {
+                case 'w': case 's': droneState.forward = 0; break;
+                case 'a': case 'd': droneState.turn = 0; break;
+                case 'arrowup': case 'arrowdown': droneState.vertical = 0; break;
+            }
+        });
+
+        // --- STREAMING_CHUNK:Virtual Joystick Controls ---
+        function setupJoystick(zoneId, knobId, onMove) {
+            const zone = document.getElementById(zoneId);
+            const knob = document.getElementById(knobId);
+            const radius = 35; // 搖桿最大移動半徑
+            let active = false;
+            let centerX, centerY;
+
+            const reset = () => {
+                active = false;
+                knob.style.transform = `translate(0px, 0px)`;
+                onMove(0, 0);
+            };
+
+            const handleStart = (e) => {
+                active = true;
+                const rect = zone.getBoundingClientRect();
+                centerX = rect.left + rect.width / 2;
+                centerY = rect.top + rect.height / 2;
+                handleMove(e);
+            };
+
+            const handleMove = (e) => {
+                if (!active) return;
+                e.preventDefault();
+                const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+                const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+                
+                let dx = clientX - centerX;
+                let dy = clientY - centerY;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                
+                if (dist > radius) {
+                    dx = (dx / dist) * radius;
+                    dy = (dy / dist) * radius;
+                }
+                
+                knob.style.transform = `translate(${dx}px, ${dy}px)`;
+                // 歸一化 -1 到 1 (Y軸方向在畫面上向下為正，所以取負號以符合直覺：上推前進)
+                onMove(dx / radius, -dy / radius);
+            };
+
+            zone.addEventListener('mousedown', handleStart);
+            window.addEventListener('mousemove', handleMove);
+            window.addEventListener('mouseup', reset);
+            
+            zone.addEventListener('touchstart', handleStart, {passive: false});
+            window.addEventListener('touchmove', handleMove, {passive: false});
+            window.addEventListener('touchend', reset);
+            window.addEventListener('touchcancel', reset);
+        }
+
+        // 左搖桿：X=轉向(turn), Y=前進/後退(forward)
+        setupJoystick('joystick-left', 'knob-left', (x, y) => {
+            droneState.turn = x;
+            droneState.forward = y;
+        });
+
+        // 右搖桿：Y=上升/下降(vertical)
+        setupJoystick('joystick-right', 'knob-right', (x, y) => {
+            droneState.vertical = y;
+        });
+
+        // --- STREAMING_CHUNK:Location Selection and Search ---
+        // 下拉選單跳轉
+        document.getElementById('location-select').addEventListener('change', (e) => {
+            const [lon, lat, z] = e.target.value.split(',').map(Number);
+            const camera = view.camera.clone();
+            camera.position.longitude = lon;
+            camera.position.latitude = lat;
+            camera.position.z = z;
+            camera.heading = 0;
+            camera.tilt = 75;
+            view.camera = camera;
+            showToast(`已跳轉至：${e.target.options[e.target.selectedIndex].text}`);
+            e.target.blur(); // 移除焦點避免按空白鍵時觸發選單
+            updateAddress(lon, lat); // 跳轉後更新地址
+        });
+
+        // 搜尋功能 (使用開放且免費的 Nominatim API)
+        async function performSearch() {
+            const input = document.getElementById('search-input');
+            const query = input.value.trim();
+            if (!query) return;
+
+            showToast("搜尋中...");
+            try {
+                // 加上 "台灣" 關鍵字以提高本地搜尋準確度
+                const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query + ' 台灣')}`);
+                const data = await res.json();
+                
+                if (data && data.length > 0) {
+                    const lon = parseFloat(data[0].lon);
+                    const lat = parseFloat(data[0].lat);
+                    
+                    const camera = view.camera.clone();
+                    camera.position.longitude = lon;
+                    camera.position.latitude = lat;
+                    camera.position.z = 600; // 預設跳轉高度
+                    camera.heading = 0;
+                    camera.tilt = 75;
+                    view.camera = camera;
+                    
+                    showToast(`已抵達：${query}`);
+                    input.value = ''; // 清空輸入框
+                    input.blur();
+                    updateAddress(lon, lat); // 抵達後更新地址
+                } else {
+                    showToast(`找不到相關景點：${query}`);
+                }
+            } catch (err) {
+                showToast("網路搜尋失敗，請稍後再試。");
+            }
+        }
+
+        document.getElementById('search-btn').addEventListener('click', performSearch);
+        document.getElementById('search-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') performSearch();
+        });
+
+    </script>
+</body>
+</html>
